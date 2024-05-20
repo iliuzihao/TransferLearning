@@ -145,8 +145,8 @@ class dbtl:
         best_acc = 0.0
         # self.criterion = nn.CrossEntropyLoss(weight=weights)
         for epoch in range(self.args.max_epoch):
-            print(
-                f"Epoch {epoch}: Max weight={np.max(weights)}, Min weight={np.min(weights)}, Mean weight={np.mean(weights)}")
+            # print(
+            #     f"Epoch {epoch}: Max weight={np.max(weights)}, Min weight={np.min(weights)}, Mean weight={np.mean(weights)}")
             all_labels = []
             all_predictions = []
             epoch_labels = []
@@ -156,7 +156,7 @@ class dbtl:
             self.model.train()
             total_loss = 0.0
             correct_predictions = 0
-            normalize_weights(weights)
+            weights = normalize_weights(weights)
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=1e-4)
             # train
             for inputs, labels, indices in self.dataloaders['train']:
@@ -166,7 +166,6 @@ class dbtl:
                 self.optimizer.zero_grad()
 
                 outputs = self.model(inputs)
-                print(np.max(weights))
                 current_weights = torch.tensor(weights[indices], dtype=torch.float32, device=self.device)
 
                 losses = F.cross_entropy(outputs, labels, reduction='none')
@@ -194,7 +193,10 @@ class dbtl:
 
             epoch_loss = total_loss / len(self.dataloaders['train'].dataset)
             epoch_acc = correct_predictions / len(self.dataloaders['train'].dataset)
-            logging.info(f'Train Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+            logging.info(f' Acc: {epoch_acc:.4f} Train Loss: {epoch_loss:.4f}')
+
+            self.writer.add_scalar('Train/Loss', epoch_loss, epoch)
+            self.writer.add_scalar('Train/Accuracy', epoch_acc, epoch)
 
             beta_e = calculate_beta_e(weights, epoch_indices, epoch_preds, epoch_labels, self.n_source)
             weights = update_weights(weights, epoch_preds, epoch_indices, epoch_labels, beta, beta_e, self.n_source)
@@ -217,8 +219,9 @@ class dbtl:
 
             val_epoch_loss = val_loss / len(self.dataloaders['val'].dataset)
             val_epoch_acc = val_corrects / len(self.dataloaders['val'].dataset)
-            logging.info(f'Val Loss: {val_epoch_loss:.4f} Acc: {val_epoch_acc:.4f}')
-
+            logging.info(f'Acc: {val_epoch_acc:.4f} Val Loss: {val_epoch_loss:.4f} ')
+            self.writer.add_scalar('Val/Loss', val_epoch_loss, epoch)
+            self.writer.add_scalar('Val/Accuracy', val_epoch_acc, epoch)
 
             if val_epoch_acc > best_acc:
                 best_acc = val_epoch_acc
@@ -237,48 +240,33 @@ class dbtl:
 
 
 
-# def update_weights(weights, predictions, indices, true_labels, beta, beta_e, n_source):
-#     for i, idx in enumerate(indices):
-#         pred = predictions[i]
-#         true = true_labels[i]
-#         if idx < n_source:  # 源域样本
-#             if pred != true:
-#                 weights[idx] *= beta
-#             else:
-#                 weights[idx] *= (1 - beta)
-#         else:  # 目标域样本
-#             if pred != true:
-#                 weights[idx] *= beta_e
-#             else:
-#                 weights[idx] /= beta_e
-#
-#     weights_exp = np.exp(weights - np.max(weights))  # Softmax 归一化
-#     weights = weights_exp / np.sum(weights_exp)
-#     return weights
+
 def update_weights(weights, predictions, indices, true_labels, beta, beta_e, n_source):
     for i, idx in enumerate(indices):
         pred = predictions[i]
         true = true_labels[i]
-        error_sign = -1 if pred == true else 1
         if idx < n_source:
-            weights[idx] *= np.exp(beta * error_sign)
+            if pred != true:
+                weights[idx] *= beta
         else:
-            weights[idx] *= np.exp(beta_e * error_sign)
+            if pred != true:
+                weights[idx] *= beta_e
 
-    # 防止权重过小或过大，重新归一化
-    weights /= np.sum(weights)
-    return weights
+        weights /= np.sum(weights)
+        return weights
 
 
 def calculate_beta_e(weights, indices, predictions, labels, n_source):
-    indices = np.array(indices)
-    predictions = np.array(predictions)
-    labels = np.array(labels)
+    target_indices = indices[indices >= n_source]
+    target_predictions = predictions[target_indices]
+    target_labels = labels[target_indices]
+    target_weights = weights[target_indices]
 
-    target_indices = indices[indices >= n_source] - n_source
-    target_errors = predictions[target_indices] != labels[target_indices]
-    error_e = np.sum(weights[target_indices][target_errors]) / np.sum(weights[target_indices])
-    beta_e = error_e / (1.0 - error_e) if error_e < 1.0 else 1.0
+    error_mask = target_predictions != target_labels
+    weighted_errors = target_weights[error_mask]
+    error_e = np.sum(weighted_errors) / np.maximum(np.sum(target_weights), 1e-8)
+    beta_e = error_e / (1.0 - error_e)
+
     return beta_e
 
 
@@ -291,8 +279,6 @@ def normalize_weights(weights):
 
 
 def calculate_and_log_metrics(all_labels, all_predictions, num_classes):
-    # all_labels = all_labels.cpu().numpy() if all_labels.is_cuda else all_labels.numpy()
-    # all_predictions = all_predictions.cpu().numpy() if all_predictions.is_cuda else all_predictions.numpy()
 
     precision, recall, fscore, support = precision_recall_fscore_support(all_labels, all_predictions, average=None)
 
@@ -311,4 +297,5 @@ def calculate_and_log_metrics(all_labels, all_predictions, num_classes):
     logging.info('\nConfusion Matrix (formatted):')
     for row in cm:
         logging.info(' '.join(f'{num:5d}' for num in row))
+
 
