@@ -265,6 +265,8 @@ def calculate_beta_e(weights, indices, predictions, labels, n_source):
     error_mask = target_predictions != target_labels
     weighted_errors = target_weights[error_mask]
     error_e = np.sum(weighted_errors) / np.maximum(np.sum(target_weights), 1e-8)
+    if error_e > 0.5:
+        error_e = 0.5
     beta_e = error_e / (1.0 - error_e)
 
     return beta_e
