@@ -163,7 +163,7 @@ class PHMFFT(object):
                 source_data, source_labels = get_files(self.data_dir, Case1, label1)
 
             source_pd = pd.DataFrame({"data": source_data, "label": source_labels})
-            train_pd, val_pd = train_test_split(source_pd, train_size=0.2, test_size=0.8, random_state=40, stratify=source_pd["label"])
+            train_pd, val_pd = train_test_split(source_pd, train_size=0.8, test_size=0.2, random_state=40, stratify=source_pd["label"])
             source_train = dataset(list_data=train_pd, transform=self.data_transforms['train'])
             source_val = dataset(list_data=val_pd, transform=self.data_transforms['val'])
 
