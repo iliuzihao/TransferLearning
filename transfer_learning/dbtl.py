@@ -8,7 +8,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch import optim
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, WeightedRandomSampler
 import numpy as np
 from itertools import chain
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
@@ -55,26 +55,27 @@ class dbtl:
 
         self.n_source = len(self.datasets['source_train'])
         self.n_target = len(self.datasets['target_train'])
-        self.n_target = len(self.datasets['target_val'])
+        self.n_target_val = len(self.datasets['target_val'])
 
         print(self.n_source)
         print(self.n_target)
+        print(self.n_target_val)
 
         # concat_dataset = ConcatDataset([self.datasets['source_train'], self.datasets['target_train']])
 
         self.datasets['train'] = BatchIdxDataset([self.datasets['source_train'], self.datasets['target_train']])
         self.datasets['val'] = self.datasets['target_val']
+        print(len(self.datasets['train']))
         print(len(self.datasets['val']))
         # print(self.datasets['val'].lengths)
         self.dataloaders = {
             'train': torch.utils.data.DataLoader(self.datasets['train'], batch_size=self.args.batch_size,
-                                                        shuffle=True, num_workers=self.args.num_workers,
-                                                        pin_memory=True),
+                                                shuffle=True, num_workers=self.args.num_workers,
+                                                pin_memory=True),
             'val': torch.utils.data.DataLoader(self.datasets['val'], batch_size=self.args.batch_size,
-                                                      shuffle=False, num_workers=self.args.num_workers,
-                                                      pin_memory=True)
+                                                shuffle=False, num_workers=self.args.num_workers,
+                                                pin_memory=True)
         }
-
 
         self.num_classes = 8
         self.prepare_model(args, dataset)
@@ -83,11 +84,9 @@ class dbtl:
 
         self.model = getattr(models, args.model_name)(args.pretrained==False)
         if (args.model_name == 'MLP'):
-            # self.model.classifier = nn.Linear(10, dataset.num_classes)
             self.model.fc = nn.Linear(self.model.classifier.in_features, dataset.num_classes)
         else:
             self.model.fc = torch.nn.Linear(self.model.fc.in_features, dataset.num_classes)
-
 
         if args.model_name == 'CNN':
             layers_to_freeze = [self.model.layer1, self.model.layer2, self.model.layer3]
@@ -103,8 +102,6 @@ class dbtl:
 
         if self.device_count > 1:
             self.model = torch.nn.DataParallel(self.model)
-            # if args.adabn:
-            #     self.model_eval = torch.nn.DataParallel(self.model_eval)
 
         # Define the optimizer
         if args.opt == 'sgd':
@@ -134,19 +131,18 @@ class dbtl:
 
         self.model.to(self.device)
 
-        # if args.adabn:
-        #     self.model_eval.to(self.device)
-
-
     def train(self):
-
         weights = np.concatenate((np.ones(self.n_source) / self.n_source, np.ones(self.n_target) / self.n_target))
         beta = 1 / (1 + np.sqrt(2 * np.log(self.n_source) / self.args.max_epoch))
         best_acc = 0.0
-        # self.criterion = nn.CrossEntropyLoss(weight=weights)
+
+        sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+        self.dataloaders['train'] = DataLoader(self.datasets['train'], batch_size=self.args.batch_size,
+                                            sampler=sampler, num_workers=self.args.num_workers,
+                                            pin_memory=True)
+
         for epoch in range(self.args.max_epoch):
-            # print(
-            #     f"Epoch {epoch}: Max weight={np.max(weights)}, Min weight={np.min(weights)}, Mean weight={np.mean(weights)}")
+            logging.info(f"Starting epoch {epoch}")
             all_labels = []
             all_predictions = []
             epoch_labels = []
@@ -156,20 +152,21 @@ class dbtl:
             self.model.train()
             total_loss = 0.0
             correct_predictions = 0
-            weights = normalize_weights(weights)
+
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=1e-4)
-            # train
+
+            # Train phase
             for inputs, labels, indices in self.dataloaders['train']:
+                # logging.info(f"Batch indices: {indices}")
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 indices = indices.cpu().numpy()
 
                 self.optimizer.zero_grad()
 
                 outputs = self.model(inputs)
-                current_weights = torch.tensor(weights[indices], dtype=torch.float32, device=self.device)
 
                 losses = F.cross_entropy(outputs, labels, reduction='none')
-                weighted_losses = losses * current_weights
+                weighted_losses = losses * torch.tensor(weights[indices], dtype=torch.float32, device=self.device)
                 loss = weighted_losses.mean()
 
                 loss.backward()
@@ -179,9 +176,6 @@ class dbtl:
                 _, preds = torch.max(outputs, 1)
                 correct_predictions += torch.sum(preds == labels.data).item()
 
-                # epoch_labels.append(labels.cpu().numpy())
-                # epoch_preds.append(preds.cpu().numpy())
-                # epoch_indices.append(indices)
                 epoch_labels.extend(labels.cpu().tolist())
                 epoch_preds.extend(preds.cpu().tolist())
                 epoch_indices.extend(indices.tolist())
@@ -190,18 +184,27 @@ class dbtl:
             epoch_preds = np.array(epoch_preds)
             epoch_indices = np.array(epoch_indices)
 
-
             epoch_loss = total_loss / len(self.dataloaders['train'].dataset)
             epoch_acc = correct_predictions / len(self.dataloaders['train'].dataset)
-            logging.info(f' Acc: {epoch_acc:.4f} Train Loss: {epoch_loss:.4f}')
+            logging.info(f'Acc: {epoch_acc:.4f} Train Loss: {epoch_loss:.4f}')
 
             self.writer.add_scalar('Train/Loss', epoch_loss, epoch)
             self.writer.add_scalar('Train/Accuracy', epoch_acc, epoch)
 
             beta_e = calculate_beta_e(weights, epoch_indices, epoch_preds, epoch_labels, self.n_source)
             weights = update_weights(weights, epoch_preds, epoch_indices, epoch_labels, beta, beta_e, self.n_source)
+            # logging.info(f"Updated weights: {weights}")
 
-            # val
+            # normalize the weights 
+            weights = normalize_weights(weights)
+
+            # Update the sampler with the new weights after each epoch
+            sampler = WeightedRandomSampler(weights, len(weights), replacement=True)
+            self.dataloaders['train'] = DataLoader(self.datasets['train'], batch_size=self.args.batch_size,
+                                                sampler=sampler, num_workers=self.args.num_workers,
+                                                pin_memory=True)
+
+            # Validation phase
             self.model.eval()
             val_loss = 0.0
             val_corrects = 0
@@ -229,17 +232,12 @@ class dbtl:
                 logging.info('Saved best model')
                 all_labels = np.concatenate(all_labels)
                 all_predictions = np.concatenate(all_predictions)
-                calculate_and_log_metrics(all_labels, all_predictions, self.num_classes)
+                # calculate_and_log_metrics(all_labels, all_predictions, self.num_classes)
 
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
 
         logging.info(f'Best Accuracy: {best_acc:.4f}')
-
-
-
-
-
 
 def update_weights(weights, predictions, indices, true_labels, beta, beta_e, n_source):
     for i, idx in enumerate(indices):
@@ -252,8 +250,8 @@ def update_weights(weights, predictions, indices, true_labels, beta, beta_e, n_s
             if pred != true:
                 weights[idx] *= beta_e
 
-        weights /= np.sum(weights)
-        return weights
+    weights /= np.sum(weights)
+    return weights
 
 
 def calculate_beta_e(weights, indices, predictions, labels, n_source):
@@ -265,6 +263,7 @@ def calculate_beta_e(weights, indices, predictions, labels, n_source):
     error_mask = target_predictions != target_labels
     weighted_errors = target_weights[error_mask]
     error_e = np.sum(weighted_errors) / np.maximum(np.sum(target_weights), 1e-8)
+
     if error_e > 0.5:
         error_e = 0.5
     beta_e = error_e / (1.0 - error_e)
@@ -279,9 +278,7 @@ def normalize_weights(weights):
     return weights
 
 
-
 def calculate_and_log_metrics(all_labels, all_predictions, num_classes):
-
     precision, recall, fscore, support = precision_recall_fscore_support(all_labels, all_predictions, average=None)
 
     num_classes = len(set(all_labels))
@@ -299,5 +296,3 @@ def calculate_and_log_metrics(all_labels, all_predictions, num_classes):
     logging.info('\nConfusion Matrix (formatted):')
     for row in cm:
         logging.info(' '.join(f'{num:5d}' for num in row))
-
-
